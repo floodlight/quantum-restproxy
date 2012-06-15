@@ -1,0 +1,186 @@
+# External REST API Specification
+#
+# This is the specification of the REST API that needs to be supported
+# by the network ctrl for QuantumRestProxy to work correctly
+#
+
+# Create Network
+POST /quantum/1.0/tenants/:tenant/networks
+{
+    "network": {
+        "id": "158233b0-ca9a-40b4-8614-54a4a99d47d1",
+        "name": "test_network",
+        "gateway": "10.0.0.1"
+    }
+}
+
+# Update Network - entries to update (like name/gateway are optional)
+PUT /quantum/1.0/tenants/:tenant/networks/:network
+{
+    "network": {
+        "name": "test_create_network",
+        "gateway": "10.0.0.1"
+    }
+}
+
+# Delete Network
+DELETE /quantum/1.0/tenants/:tenant/networks/:network
+
+# Create Port
+POST /quantum/1.0/tenants/:tenant/networks/:network/ports
+{
+    "port": {
+        "id": "158233b0-ca9a-40b4-8614-54a4a99d47e1",
+        "state": "ACTIVE"
+    }
+}
+
+# Update Port - entries to update (like state are optional)
+PUT /quantum/1.0/tenants/:tenant/networks/:network/ports/:port
+{
+    "port": {
+        "state": "ACTIVE"
+    }
+}
+
+
+# Delete Port
+DELETE /quantum/1.0/tenants/:tenant/networks/:network/ports/:port
+
+# Create Attachment
+PUT /quantum/1.0/tenants/:tenant/networks/:network/ports/:port/attachment
+{
+    "attachment": {
+        "id": "158233b0-ca9a-40b4-8614-54a4a99d47f1",
+        "mac": "01:02:03:04:05:06"
+    }
+}
+
+# Delete Attachment
+DELETE /quantum/1.0/tenants/:tenant/networks/:network/ports/:port/attachment
+
+# Send complete current topology to network ctrl
+PUT /quantum/1.0/topology
+{
+    "networks": [
+        {
+            "id": "158233b0-ca9a-40b4-8614-54a4a99d47d1",
+            "name": "test_network_1",
+            "gateway": "10.0.1.1",
+            "op-status": "ACTIVE" 
+            "ports": [
+                {
+                    "id": "158233b0-ca9a-40b4-8614-54a4a99d47e1",
+                    "state": "ACTIVE",
+                    "op-status": "UP",
+                    "attachment": {
+                        "id": "158233b0-ca9a-40b4-8614-54a4a99d4701",
+                        "mac": "01:02:03:00:00:01"
+                    }
+                },
+                {
+                    "id": "158233b0-ca9a-40b4-8614-54a4a99d47e2",
+                    "state": "ACTIVE",
+                    "op-status": "UP",
+                    "attachment": {
+                        "id": "158233b0-ca9a-40b4-8614-54a4a99d4702",
+                        "mac": "01:02:03:00:00:02"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "158233b0-ca9a-40b4-8614-54a4a99d47d2",
+            "name": "test_network_2",
+            "gateway": "10.0.2.1",
+            "op-status": "ACTIVE" 
+            "ports": [
+                {
+                    "id": "158233b0-ca9a-40b4-8614-54a4a99d47e3",
+                    "state": "ACTIVE",
+                    "op-status": "UP",
+                    "attachment": {
+                        "id": "158233b0-ca9a-40b4-8614-54a4a99d4703",
+                        "mac": "01:02:03:00:00:03"
+                    }
+                },
+                {
+                    "id": "158233b0-ca9a-40b4-8614-54a4a99d47e4",
+                    "state": "ACTIVE",
+                    "op-status": "UP",
+                    "attachment": {
+                        "id": "158233b0-ca9a-40b4-8614-54a4a99d4704",
+                        "mac": "01:02:03:00:00:04"
+                    }
+                }
+            ]
+        }
+    ]
+}
+
+#
+# Reads are not required to implemented by the network ctrl since they are
+# handled the proxy plugin locally. The following is provided as an optional
+# interface that can be implemented by the network ctrl for debug/support
+#
+
+# Read Networks
+GET /quantum/1.0/tenants/:tenant/networks/:network
+{
+    "network": {
+        "id": "158233b0-ca9a-40b4-8614-54a4a99d47d1",
+        "name": "test_network_1",
+        "op-status": "ACTIVE" 
+}
+
+GET /quantum/1.0/tenants/:tenant/networks/:network/detail
+{
+    "network": {
+        "id": "158233b0-ca9a-40b4-8614-54a4a99d47d1",
+        "name": "test_network_1",
+        "op-status": "ACTIVE" 
+        "gateway": "10.0.1.1",
+        "ports": [
+            {
+                "id": "158233b0-ca9a-40b4-8614-54a4a99d47e1",
+                "state": "ACTIVE",
+                "op-status": "UP",
+                "attachment": {
+                    "id": "158233b0-ca9a-40b4-8614-54a4a99d4701",
+                    "mac": "01:02:03:00:00:01"
+                }
+            },
+            {
+                "id": "158233b0-ca9a-40b4-8614-54a4a99d47e2",
+                "state": "ACTIVE",
+                "op-status": "UP",
+                "attachment": {
+                    "id": "158233b0-ca9a-40b4-8614-54a4a99d4702",
+                    "mac": "01:02:03:00:00:02"
+                }
+            }
+        ]
+    }
+}
+
+# Read Ports
+GET /quantum/1.0/tenants/:tenant/networks/:network/ports/:port
+{
+    "ports": {
+        "id": "158233b0-ca9a-40b4-8614-54a4a99d47e1",
+        "state": "ACTIVE"
+    }
+}
+
+GET /quantum/1.0/tenants/:tenant/networks/:network/ports/:port/detail
+{
+    "ports": {
+        "id": "158233b0-ca9a-40b4-8614-54a4a99d47e1",
+        "state": "ACTIVE",
+        "op-status": "UP",
+        "attachment": {
+            "id": "158233b0-ca9a-40b4-8614-54a4a99d4701",
+            "mac": "01:02:03:00:00:01"
+        }
+    }
+}
