@@ -1,24 +1,45 @@
 #!/bin/sh
 #
 # Install essex/stable devstack and openstack with quantum and restproxy
-# Note:   this script uses the same password for all openstack services
+# Note:
+#   1. this script uses the same password for all openstack services
+#   2. this script uses the restproxy code with tag 'for-exxex/stable'
+#      (unset RESTPROXY_GITTAG variable to use restproxy in current dir)
+#
 # See usage below:
 USAGE="$0 <network-controller-for-restproxy> [[port] [<password>]]"
 
 set -e
 
 # set parameters
-RESTPROXY_TARFILE="${HOME}/restproxy.tar"
 RESTPROXY_CONTROLLER=$1
 RESTPROXY_CONTROLLER_PORT=${2:-'80'}
 STACK_PASSWORD=${3:-'nova'}
 STACK_TOP='/opt/stack'
+RESTPROXY_GITTAG="for-essex/stable"
+QAUNTUM_PLUGINDIR="${STACK_TOP}/quantum/quantum/plugins"
 
-# Validate args
-if [ ! -f "${RESTPROXY_TARFILE}" ] ; then
-    echo "ERROR: File '${RESTPROXY_TARFILE}' not found." 1>&2
+#
+# Validate env
+#
+if [ ! -f /etc/lsb-release ] ; then
+    echo "ERROR: This script is only supported on ubuntu" 1>&2
     exit 1
 fi
+eval `cat /etc/lsb-release`
+if [ "${DISTRIB_RELEASE}"x != "12.04"x ] ; then
+    echo "ERROR: This script is only supported on ubuntu 12.04" 1>&2
+    exit 1
+fi
+
+RESTPROXY_HOMEDIR=`dirname $0`/..
+if [ ! -d "${RESTPROXY_HOMEDIR}" ] ; then
+    echo "ERROR: Directory '${RESTPROXY_HOMEDIR}' not found." 1>&2
+    exit 1
+fi
+RESTPROXY_HOMEDIR=`cd ${RESTPROXY_HOMEDIR}; pwd`
+
+# Validate args
 if [ "${RESTPROXY_CONTROLLER}"x = ""x ] ; then
     echo "ERROR: RESTPROXY_CONTROLLER not defined." 1>&2
     echo "USAGE: ${USAGE}" 2>&1
@@ -90,7 +111,7 @@ novadb=mysql://root:${STACK_PASSWORD}@localhost/nova
 #
 # Network controllers
 #
-servers=${RESTPROXY_CONTROLLER}:80
+servers=${RESTPROXY_CONTROLLER}:${RESTPROXY_CONTROLLER_PORT}
 serverauth=
 serverssl=
 EOF
@@ -229,14 +250,28 @@ EOF
 sudo service libvirt-bin stop
 sudo service libvirt-bin start
 
-# Setup restproxy anf it's configuration
+# Install restproxy in quantum tree
 (
-    cd ${STACK_TOP}/quantum/quantum/plugins
-    tar xvf ${RESTPROXY_TARFILE}
+    cd ${HOME}/devstack
+    if [ "${RESTPROXY_GITTAG}"x != ""x ] ; then
+        git clone git@github.com:floodlight/quantum-restproxy.git restproxy
+        cd restproxy
+        git checkout "${RESTPROXY_GITTAG}"
+    else
+        mkdir restproxy
+        cd restproxy
+        (cd ${RESTPROXY_HOMEDIR}; tar cf - .) | sudo tar xvf -
+    fi
+
+    (cd ${QAUNTUM_PLUGINDIR} ; sudo rm -rf restproxy)
+    sudo mv ${HOME}/devstack/restproxy ${QAUNTUM_PLUGINDIR}
 )
+
+# set up restproxy config
+cd ${HOME}/devstack
+cp localrc.restproxy localrc
 sudo mkdir -p /etc/quantum/plugins/restproxy
 sudo cp restproxy.ini /etc/quantum/plugins/restproxy/restproxy.ini
-cp localrc.restproxy localrc
 
 # Done
 echo "$0 Done."
