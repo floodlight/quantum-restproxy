@@ -65,6 +65,24 @@ that context.
 The sections below describe how to configure and run the a system using this
 plugin.
 
+#### Installing restproxy with devstack
+
+A script is provided (scripts/install-devstack.sh) to help with testing this
+plugin with essex/stable branch of devstack (and other openstack components).
+
+On a ubuntu 12.04 system, copy this script and run as:
+> install-devstack.sh <network-controller> [<port> [<password>]]
+
+The port defaults to 80, and the password to "nova".
+
+After the the script has run sucessfully, you can start devstack as usual:
+> cd ~/devstack
+> ./stack.sh
+
+> **NOTE:** The network controller must be available for devstack to run,
+> otherwise the devstack initialization will fail since it will not be able
+> to create the default network.
+
 #### Nova configuration (controller node)
 
 Configure nova-network to use quantum network manager. In the nova.conf add:
@@ -139,4 +157,4 @@ equivalent to the following:
 
 To run tests related to the Plugin run the following from the top level Quantum
 directory:
-  PLUGIN_DIR=quantum/plugins/restproxy ./run_tests.sh -N
+>  PLUGIN_DIR=quantum/plugins/restproxy ./run_tests.sh -N
