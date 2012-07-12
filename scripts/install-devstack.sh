@@ -53,7 +53,7 @@ sudo apt-get -y install gcc make python-all-dev python-pip git
 
 # get devstack
 cd ${HOME}
-git clone git://github.com/openstack-dev/devstack.git
+git clone http://github.com/openstack-dev/devstack.git
 
 cd ${HOME}/devstack
 cat >localrc.ovs <<EOF
