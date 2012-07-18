@@ -254,7 +254,7 @@ sudo service libvirt-bin start
 (
     cd ${HOME}/devstack
     if [ "${RESTPROXY_GITTAG}"x != ""x ] ; then
-        git clone git@github.com:floodlight/quantum-restproxy.git restproxy
+        git clone http://github.com/floodlight/quantum-restproxy.git restproxy
         cd restproxy
         git checkout "${RESTPROXY_GITTAG}"
     else
