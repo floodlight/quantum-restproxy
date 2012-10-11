@@ -51,22 +51,26 @@ import logging
 import os
 import socket
 import sys
-from sqlalchemy import create_engine, orm, MetaData
-from sqlalchemy import Table, Column, Integer, Text, VARCHAR
+from sqlalchemy import create_engine, MetaData
+from sqlalchemy import Table, Column, Integer, VARCHAR
 
-from quantum.api.api_common import OperationalStatus
-from quantum.common import exceptions as exc
+from quantum.common import exceptions
+from quantum.common import topics
 from quantum.db import api as db
-from quantum.quantum_plugin_base import QuantumPluginBase
-from version import version_string_with_vcs as version
-
+from quantum.db import db_base_plugin_v2
+from quantum.db import dhcp_rpc_base
+from quantum.db import models_v2
+from quantum.openstack.common import context as glbcontext
+from quantum.openstack.common.rpc import dispatcher
+from quantum.openstack.common import rpc
+from quantum.plugins.restproxy.version import version_string_with_vcs
 
 gettext.install("quantum", unicode=1)
 LOG = logging.getLogger('quantum.plugins.QuantumRestProxy')
 LOG.setLevel(logging.INFO)
 
 
-class ConfigurationError(exc.QuantumException):
+class ConfigurationError(exceptions.QuantumException):
     def __init__(self, message):
         if message is None:
             message = ""
@@ -76,7 +80,7 @@ class ConfigurationError(exc.QuantumException):
         super(ConfigurationError, self).__init__()
 
 
-class RemoteRestError(exc.QuantumException):
+class RemoteRestError(exceptions.QuantumException):
     def __init__(self, message):
         if message is None:
             message = ""
@@ -334,7 +338,18 @@ class ServerPool(object):
         return self.rest_call('DELETE', resource, data, headers)
 
 
-class QuantumRestProxy(QuantumPluginBase):
+class RpcProxy(dhcp_rpc_base.DhcpRpcCallbackMixin):
+
+    RPC_API_VERSION = '1.0'
+
+    def __init__(self, rpc_context):
+        self.rpc_context = rpc_context
+
+    def create_rpc_dispatcher(self):
+        return dispatcher.RpcDispatcher([self])
+
+
+class QuantumRestProxy(db_base_plugin_v2.QuantumDbPluginV2):
 
     def __init__(self):
         # Read configuration, for unit tests pass in conf as first arg
@@ -353,7 +368,8 @@ class QuantumRestProxy(QuantumPluginBase):
             self.conf = ConfigProxy('quantum/plugins/restproxy', \
                 'restproxy.ini', 'restproxy')
         self.setup_logging()
-        LOG.info('QuantumRestProxy: Starting plugin. Version=%s' % version())
+        LOG.info('QuantumRestProxy: Starting plugin. Version=%s' %
+            version_string_with_vcs())
 
         # read config
         proxydb = self.conf.get('proxydb') or \
@@ -365,7 +381,7 @@ class QuantumRestProxy(QuantumPluginBase):
         serverssl = self.conf.get_bool('serverssl')
 
         # validate config
-        assert novadb or novaauth, 'Nova must be accessible from plugin'
+        assert novadb, 'Nova must be accessible from plugin'
         assert servers is not None, 'Servers not defined. Aborting plugin'
         servers = tuple(s.split(':') for s in servers.split(','))
         servers = tuple((server, int(port)) for server, port in servers)
@@ -373,14 +389,30 @@ class QuantumRestProxy(QuantumPluginBase):
                 'Syntax error in servers in config file. Aborting plugin'
 
         # init DB, nova and network ctrl connections
-        db.configure_db({'sql_connection': proxydb})
+        db.configure_db({
+            'sql_connection': proxydb,
+            'base': models_v2.model_base.BASEV2,
+        })
         self.nova = NovaDbProxy(novadb)
         self.servers = ServerPool(servers, serverssl, serverauth)
 
+        # init dhcp support
+        self.topic = topics.PLUGIN
+        self.rpc_context = glbcontext.RequestContext(
+            'quantum', 'quantum', is_admin=False)
+        self.conn = rpc.create_connection(new=True)
+        self.callbacks = RpcProxy(self.rpc_context)
+        self.dispatcher = self.callbacks.create_rpc_dispatcher()
+        self.conn.create_consumer(self.topic, self.dispatcher,
+                                  fanout=False)
+        # Consume from all consumers in a thread
+        self.conn.consume_in_thread()
+
+
     def setup_logging(self):
         root_logger = LOG
-        LOG_FORMAT = "%(asctime)s %(levelname)8s [%(name)s] %(message)s"
-        LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+        log_format = "%(asctime)s %(levelname)8s [%(name)s] %(message)s"
+        log_date_format = "%Y-%m-%d %H:%M:%S"
 
         if self.conf.get_bool('debug'):
             root_logger.setLevel(logging.DEBUG)
@@ -390,8 +422,8 @@ class QuantumRestProxy(QuantumPluginBase):
             root_logger.setLevel(logging.WARNING)
 
         # Set log configuration from options or defaults
-        log_format = self.conf.get('log_format') or LOG_FORMAT
-        log_date_format = self.conf.get('log_date_format') or LOG_DATE_FORMAT
+        log_format = self.conf.get('log_format') or log_format
+        log_date_format = self.conf.get('log_date_format') or log_date_format
         formatter = logging.Formatter(log_format, log_date_format)
 
         logfile = self.conf.get('log_file')
@@ -410,111 +442,416 @@ class QuantumRestProxy(QuantumPluginBase):
         handler.setFormatter(formatter)
         root_logger.addHandler(handler)
 
-    def get_network(self, tenant_id, network_id):
-        db.validate_network_ownership(tenant_id, network_id)
-        try:
-            network = db.network_get(network_id)
-        except:
-            raise exc.NetworkNotFound(net_id=network_id)
-        return network
+    def create_network(self, context, network):
+        """
+        Create a network, which represents an L2 network segment which
+        can have a set of subnets and ports associated with it.
+        :param context: quantum api request context
+        :param network: dictionary describing the network
 
-    def get_port(self, tenant_id, network_id, port_id):
-        db.validate_port_ownership(tenant_id, network_id, port_id)
-        net = self.get_network(tenant_id, network_id)
-        try:
-            port = db.port_get(port_id, network_id)
-        except:
-            raise exc.PortNotFound(net_id=network_id, port_id=port_id)
-
-        # Port must exist and belong to the appropriate network.
-        if port['network_id'] != net['uuid']:
-            raise exc.PortNotFound(net_id=network_id, port_id=port_id)
-        return port
-
-    def make_port_dict(self, port):
-        if port.state == "ACTIVE":
-            op_status = port.op_status
-        else:
-            op_status = OperationalStatus.DOWN
-
-        return {
-            'port-id': str(port.uuid),
-            'port-state': port.state,
-            'port-op-status': op_status,
-            'net-id': port.network_id,
-            'attachment': port.interface_id
+        :returns: a sequence of mappings with the following signature:
+        {
+            "id": UUID representing the network.
+            "name": Human-readable name identifying the network.
+            "tenant_id": Owner of network. NOTE: only admin user can specify
+                         a tenant_id other than its own.
+            "admin_state_up": Sets admin state of network.
+                              if down, network does not forward packets.
+            "status": Indicates whether network is currently operational
+                      (values are "ACTIVE", "DOWN", "BUILD", and "ERROR")
+            "subnets": Subnets associated with this network.
         }
 
-    def filter_net(self, filter_opts, net):
-        return net
+        :raises: exceptions.NoImplementedError
+        """
 
-    def filter_port(self, filter_opts, port):
+        LOG.debug("QuantumRestProxy: create_network() called")
+
+        # Validate args
+        tenant_id = self._get_tenant_id_for_create(context, network["network"])
+        net_name = network["network"]["name"]
+        if network["network"]["admin_state_up"] is False:
+            LOG.warning("Network with admin_state_up=False are not yet "
+                        "supported by this plugin. Ignoring setting for "
+                        "network %s", net_name)
+            # For now, just force the admin_state_up to be True and continue
+            network["network"]["admin_state_up"] = True
+
+        # create in DB
+        new_net = super(QuantumRestProxy, self).create_network(context, network)
+
+        # create on networl ctrl
+        try:
+            resource = "/tenants/%s/networks" % tenant_id
+            data = {
+                "network": {
+                    "id": new_net["id"],
+                    "name": new_net["name"],
+                }
+            }
+            ret = self.servers.post(resource, data)
+            if not self.servers.action_success(ret):
+                raise RemoteRestError(ret[2])
+        except RemoteRestError as e:
+            LOG.error(
+                "QuantumRestProxy: Unable to create remote network: %s" %
+                e.message)
+            super(QuantumRestProxy, self).network_delete(context, new_net["id"])
+            raise
+
+        # return created network
+        return new_net
+
+    def update_network(self, context, net_id, network):
+        """
+        Updates the properties of a particular Virtual Network.
+        :param context: quantum api request context
+        :param net_id: uuid of the network to update
+        :param network: dictionary describing the updates
+
+        :returns: a sequence of mappings with the following signature:
+        {
+            "id": UUID representing the network.
+            "name": Human-readable name identifying the network.
+            "tenant_id": Owner of network. NOTE: only admin user can
+                         specify a tenant_id other than its own.
+            "admin_state_up": Sets admin state of network.
+                              if down, network does not forward packets.
+            "status": Indicates whether network is currently operational
+                      (values are "ACTIVE", "DOWN", "BUILD", and "ERROR")
+            "subnets": Subnets associated with this network.
+        }
+
+        :raises: exceptions.NoImplementedError
+        :raises: exceptions.NetworkNotFound
+        """
+
+        LOG.debug("QuantumRestProxy.update_network() called")
+
+        # Validate Args
+        if network["network"].get("admin_state_up"):
+            if network["network"]["admin_state_up"] is False:
+                raise exceptions.NotImplementedError("admin_state_up=False")
+
+        # update DB
+        orig_net = super(QuantumRestProxy, self).get_network(context, net_id)
+        tenant_id = orig_net["tenant_id"]
+        new_net = super(QuantumRestProxy, self).update_network(
+            context, net_id, network)
+
+        # update network on network controller
+        if new_net["name"] != orig_net["name"]:
+            try:
+                resource = "/tenants/%s/networks/%s" % (tenant_id, net_id)
+                data = {
+                    "network": new_net,
+                }
+                ret = self.servers.put(resource, data)
+                if not self.servers.action_success(ret):
+                    raise RemoteRestError(ret[2])
+            except RemoteRestError as e:
+                LOG.error(
+                    "QuantumRestProxy: Unable to update remote network: %s" %
+                    e.message)
+                # reset network to original state
+                super(QuantumRestProxy, self).update_network(
+                    context, id, orig_net)
+                raise
+
+        # return updated network
+        return new_net
+
+    def delete_network(self, context, net_id):
+        """
+        Delete a network.
+        :param context: quantum api request context
+        :param id: UUID representing the network to delete.
+
+        :returns: None
+
+        :raises: exceptions.NetworkInUse
+        :raises: exceptions.NetworkNotFound
+        """
+
+        LOG.debug("QuantumRestProxy: delete_network() called")
+
+        # Validate args
+        orig_net = super(QuantumRestProxy, self).get_network(context, net_id)
+        tenant_id = orig_net["tenant_id"]
+        super(QuantumRestProxy, self).delete_network(context, net_id)
+
+        # delete from network ctrl. Remote error on delete is ignored
+        try:
+            resource = "/tenants/%s/networks/%s" % (tenant_id, net_id)
+            ret = self.servers.delete(resource)
+            if not self.servers.action_success(ret):
+                raise RemoteRestError(ret[2])
+        except RemoteRestError as e:
+            LOG.error(
+                "QuantumRestProxy: Unable to update remote network: %s" %
+                e.message)
+
+        # return None
+        return None
+
+    def create_port(self, context, port):
+        """
+        Create a port, which is a connection point of a device
+        (e.g., a VM NIC) to attach to a L2 Quantum network.
+        :param context: quantum api request context
+        :param port: dictionary describing the port
+
+        :returns:
+        {
+            "id": uuid represeting the port.
+            "network_id": uuid of network.
+            "tenant_id": tenant_id
+            "mac_address": mac address to use on this port.
+            "admin_state_up": Sets admin state of port. if down, port
+                              does not forward packets.
+            "status": dicates whether port is currently operational
+                      (limit values to "ACTIVE", "DOWN", "BUILD", and "ERROR")
+            "fixed_ips": list of subnet ID"s and IP addresses to be used on
+                         this port
+            "device_id": identifies the device (e.g., virtual server) using
+                         this port.
+        }
+
+        :raises: exceptions.NetworkNotFound
+        :raises: exceptions.StateInvalid
+        """
+
+        # Validate Args
+        LOG.debug("QuantumRestProxy: create_port() called")
+
+        # Update DB
+        port["port"]["admin_state_up"] = False
+        new_port = super(QuantumRestProxy, self).create_port(context, port)
+        net = super(QuantumRestProxy, self).get_network(
+                context, new_port["network_id"])
+
+        # create on networl ctrl
+        try:
+            resource = "/tenants/%s/networks/%s/ports" % (
+                    net["tenant_id"], net["id"])
+            data = {
+                "port": {
+                    "id": new_port["id"],
+                    "state": "ACTIVE",
+                }
+            }
+            ret = self.servers.post(resource, data)
+            if not self.servers.action_success(ret):
+                raise RemoteRestError(ret[2])
+
+            # connect device to network, if present
+            if port["port"].get("device_id"):
+                self.plug_interface(context,
+                    net["tenant_id"], net["id"],
+                    new_port["id"], port["port"]["device_id"])
+        except RemoteRestError as e:
+            LOG.error(
+                "QuantumRestProxy: Unable to create remote port: %s" %
+                e.message)
+            super(QuantumRestProxy, self).delete_port(context, new_port["id"])
+            raise
+
+        # Set port state up and return that port
+        port_update = {"port": {"admin_state_up": True}}
+        return super(QuantumRestProxy, self).update_port(context,
+                new_port["port"]["id"], port_update)
+
+    def update_port(self, context, port_id, port):
+        """
+        Update values of a port.
+        :param context: quantum api request context
+        :param id: UUID representing the port to update.
+        :param port: dictionary with keys indicating fields to update.
+
+        :returns: a mapping sequence with the following signature:
+        {
+            "id": uuid represeting the port.
+            "network_id": uuid of network.
+            "tenant_id": tenant_id
+            "mac_address": mac address to use on this port.
+            "admin_state_up": sets admin state of port. if down, port
+                               does not forward packets.
+            "status": dicates whether port is currently operational
+                       (limit values to "ACTIVE", "DOWN", "BUILD", and "ERROR")
+            "fixed_ips": list of subnet ID's and IP addresses to be used on
+                         this port
+            "device_id": identifies the device (e.g., virtual server) using
+                         this port.
+        }
+
+        :raises: exceptions.StateInvalid
+        :raises: exceptions.PortNotFound
+        """
+
+        LOG.debug("QuantumRestProxy: update_port() called")
+
+        # Validate Args
+        orig_port = super(QuantumRestProxy, self).get_port(context, port_id)
+
+        # Update DB
+        new_port = super(QuantumRestProxy, self).update_port(
+                context, port_id, port)
+
+        # update on networl ctrl
+        try:
+            resource = "/tenants/%s/networks/%s/ports/%s" % (
+                    orig_port["tenant_id"], orig_port["network_id"], port_id)
+            data = {
+                    "port": new_port,
+            }
+            ret = self.servers.put(resource, data)
+            if not self.servers.action_success(ret):
+                raise RemoteRestError(ret[2])
+
+            if new_port.get("device_id") != orig_port.get("device_id"):
+                if orig_port.get("device_id"):
+                    self.unplug_interface(context,
+                        orig_port["tenant_id"], orig_port["network_id"],
+                        orig_port["id"])
+                if new_port.get("device_id"):
+                    self.plug_interface(context,
+                        new_port["tenant_id"], new_port["network_id"],
+                        new_port["id"], new_port["device_id"])
+
+        except RemoteRestError as e:
+            LOG.error(
+                "QuantumRestProxy: Unable to create remote port: %s" %
+                e.message)
+            # reset port to original state
+            super(QuantumRestProxy, self).update_port(
+                    context, port_id, orig_port)
+            raise
+
+        # return new_port
+        return new_port
+
+    def delete_port(self, context, port_id):
+        """
+        Delete a port.
+        :param context: quantum api request context
+        :param id: UUID representing the port to delete.
+
+        :raises: exceptions.PortInUse
+        :raises: exceptions.PortNotFound
+        :raises: exceptions.NetworkNotFound
+        """
+
+        LOG.debug("QuantumRestProxy: delete_port() called")
+
+        # Delete from DB
+        try:
+            port = super(QuantumRestProxy, self).delete_port(context, port_id)
+        except Exception, e:
+            raise Exception("Failed to delete port: %s" % str(e))
+
+        # delete from network ctrl. Remote error on delete is ignored
+        try:
+            resource = "/tenants/%s/networks/%s/ports/%s" % (
+                    port["tenant_id"], port["network_id"], port_id)
+            ret = self.servers.delete(resource)
+            if not self.servers.action_success(ret):
+                raise RemoteRestError(ret[2])
+
+            if port.get("device_id"):
+                self.unplug_interface(context,
+                    port["tenant_id"], port["network_id"], port["id"])
+        except RemoteRestError as e:
+            LOG.error(
+                "QuantumRestProxy: Unable to update remote port: %s" %
+                e.message)
+
+        # return
         return port
 
-    def validate_port_state(self, port_state):
-        if port_state.upper() not in ('ACTIVE', 'DOWN'):
-            raise exc.StateInvalid(port_state=port_state)
-        return True
-
-    def validate_attachment(self, tenant_id, network_id, port_id,
-                             remote_interface_id):
-        for port in db.port_list(network_id):
-            if port['interface_id'] == remote_interface_id:
-                raise exc.AlreadyAttached(net_id=network_id,
-                                          port_id=port_id,
-                                          att_id=port['interface_id'],
-                                          att_port_id=port['uuid'])
-
-    def get_all_networks(self, tenant_id, **kwargs):
+    def plug_interface(self, context,
+        tenant_id, net_id, port_id, remote_interface_id):
         """
-        Returns a dictionary containing all <network_uuid, network_name> for
-        the specified tenant using local persistent store.
+        Attaches a remote interface to the specified port on the
+        specified Virtual Network.
 
-        :param tenant_id: unique identifier for the tenant whose networks
-            are being retrieved by this method
-        :param **kwargs: options to be passed to the plugin. The following
-            keywork based-options can be specified:
-            filter_opts - options for filtering network list
-        :returns: a list of mapping sequences with the following signature:
-                     [ {'net-id': uuid that uniquely identifies
-                                      the particular quantum network,
-                        'net-name': a human-readable name associated
-                                      with network referenced by net-id
-                        'net-op-status': network op_status
-                       },
-                       ....
-                       {'net-id': uuid that uniquely identifies the
-                                       particular quantum network,
-                        'net-name': a human-readable name associated
-                                       with network referenced by net-id
-                        'net-op-status': network op_status
-                       }
-                    ]
-        :raises: None
+        :returns: None
+
+        :raises: exceptions.NetworkNotFound
+        :raises: exceptions.PortNotFound
+        :raises: RemoteRestError
         """
-        LOG.debug("QuantumRestProxy: get_all_networks() called")
 
-        filter_fn = None
-        filter_opts = kwargs.get('filter_opts', None)
-        if filter_opts is not None and len(filter_opts) > 0:
-            filter_fn = self.filter_net
-            LOG.debug("QuantumRestProxy: filter_opts ignored: %s" %
-                      filter_opts)
+        LOG.debug("QuantumRestProxy: plug_interface() called")
 
-        nets = []
-        for net in db.network_list(tenant_id):
-            if filter_fn is not None and \
-               filter_fn(filter_opts, net) is None:
-                continue
-            net_item = {
-                'net-id': str(net.uuid),
-                'net-name': net.name,
-                'net-op-status': net.op_status,
-            }
-            nets.append(net_item)
-        return nets
+        # update attachment on network controller
+        try:
+            port = super(QuantumRestProxy, self).get_port(context, port_id)
+            mac = port["mac_address"]
 
-    def get_network_details(self, tenant_id, net_id):
+            for ip in port["fixed_ips"]:
+                if ip.get("subnet_id") is not None:
+                    subnet = super(QuantumRestProxy, self).get_subnet(
+                        context, ip["subnet_id"])
+                    gateway = subnet.get("gateway_ip")
+                    if gateway is not None:
+                        resource = "/tenants/%s/networks/%s" % (
+                                tenant_id, net_id)
+                        data = {
+                            "network": {
+                                "id": net_id,
+                                "gateway": gateway,
+                            }
+                        }
+                        ret = self.servers.put(resource, data)
+                        if not self.servers.action_success(ret):
+                            raise RemoteRestError(ret[2])
+
+            if mac is not None:
+                resource = "/tenants/%s/networks/%s/ports/%s/attachment" % (
+                        tenant_id, net_id, port_id)
+                data = {"attachment": {
+                    "id": remote_interface_id,
+                    "mac": mac,
+                }}
+                ret = self.servers.put(resource, data)
+                if not self.servers.action_success(ret):
+                    raise RemoteRestError(ret[2])
+        except RemoteRestError as e:
+            LOG.error(
+                "QuantumRestProxy: Unable to update remote network: %s" %
+                e.message)
+            raise
+
+        return None
+
+    def unplug_interface(self, context,
+        tenant_id, net_id, port_id):
+        """
+        Detaches a remote interface from the specified port on the
+        network controller
+
+        :returns: None
+
+        :raises: RemoteRestError
+        """
+
+        LOG.debug("QuantumRestProxy: unplug_interface() called")
+
+        # delete from network ctrl. Remote error on delete is ignored
+        try:
+            resource = "/tenants/%s/networks/%s/ports/%s/attachment" % (
+                    tenant_id, net_id, port_id)
+            ret = self.servers.delete(resource)
+            if not self.servers.action_success(ret):
+                raise RemoteRestError(ret[2])
+        except RemoteRestError as e:
+            LOG.error(
+                "QuantumRestProxy: Unable to update remote port: %s" %
+                e.message)
+
+        return None
+
+    def __get_network_details(self, tenant_id, net_id):
         """
         Retrieves a list of all the remote vifs that
         are attached to the network.
@@ -528,11 +865,11 @@ class QuantumRestProxy(QuantumPluginBase):
                                    {"port-id": "vif2"},...,
                                    {"port-id": "vifn"}]
                     }
-        :raises: exception.NetworkNotFound
+        :raises: exceptions.NetworkNotFound
         """
-        LOG.debug("QuantumRestProxy: get_network_details() called")
+        LOG.debug("QuantumRestProxy: __get_network_details() called")
         net = self.get_network(tenant_id, net_id)
-        ports = self.get_all_ports(tenant_id, net_id)
+        ports = self.__get_all_ports(tenant_id, net_id)
         return {
             'net-id': str(net.uuid),
             'net-name': net.name,
@@ -540,133 +877,7 @@ class QuantumRestProxy(QuantumPluginBase):
             'net-ports': ports,
         }
 
-    def create_network(self, tenant_id, net_name, **kwargs):
-        """
-        Creates a new Virtual Network, and assigns it
-        a symbolic name.
-
-        :returns: a sequence of mappings with the following signature:
-                    {'net-id': uuid that uniquely identifies the
-                                     particular quantum network,
-                     'net-name': a human-readable name associated
-                                    with network referenced by net-id
-                    }
-        :raises:
-        """
-        LOG.debug("QuantumRestProxy: create_network() called")
-
-        # create in DB
-        new_net = db.network_create(tenant_id, net_name)
-        db.network_update(new_net.uuid, net_name,
-                          op_status=OperationalStatus.UP)
-        net_id = str(new_net.uuid)
-
-        # create on networl ctrl
-        try:
-            resource = '/tenants/%s/networks' % tenant_id
-            data = {
-                "network": {
-                    "id": net_id,
-                    "name": net_name,
-                    "gateway": self.nova.get_gateway(net_id),
-                }
-            }
-            ret = self.servers.post(resource, data)
-            if not self.servers.action_success(ret):
-                raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to create remote network: %s' %
-                e.message)
-            db.network_destroy(net_id)
-            raise
-
-        # return created network
-        return {
-                'net-id': net_id,
-                'net-name': net_name,
-        }
-
-    def update_network(self, tenant_id, net_id, **kwargs):
-        """
-        Updates the attributes of a particular Virtual Network.
-
-        :returns: a sequence of mappings representing the new network
-                    attributes, with the following signature:
-                    {'net-id': uuid that uniquely identifies the
-                                 particular quantum network
-                     'net-name': the new human-readable name
-                                  associated with network referenced by net-id
-                    }
-        :raises: exception.NetworkNotFound
-        """
-        LOG.debug("QuantumRestProxy.update_network() called")
-        orig_net = self.get_network(tenant_id, net_id)
-
-        # update DB
-        net = db.network_update(net_id, tenant_id, **kwargs)
-
-        # update network on network controller
-        try:
-            if kwargs:
-                resource = '/tenants/%s/networks/%s' % (tenant_id, net_id)
-                data = {
-                    "network": kwargs,
-                }
-                ret = self.servers.put(resource, data)
-                if not self.servers.action_success(ret):
-                    raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to update remote network: %s' %
-                e.message)
-            # reset network to original state
-            orig_net = dict((k.split('-')[-1], v)
-                for k, v in orig_net.items())
-            if 'id' in orig_net:
-                orig_net.pop('id')
-            db.network_update(net_id, tenant_id, **orig_net)
-            raise
-
-        # return updated network
-        return net
-
-    def delete_network(self, tenant_id, net_id):
-        """
-        Deletes the network with the specified network identifier
-        belonging to the specified tenant.
-
-        :returns: a sequence of mappings with the following signature:
-                    {'net-id': uuid that uniquely identifies the
-                                 particular quantum network
-                    }
-        :raises: exception.NetworkInUse
-        :raises: exception.NetworkNotFound
-        """
-        LOG.debug("QuantumRestProxy: delete_network() called")
-        net = self.get_network(tenant_id, net_id)
-        for port in db.port_list(net_id):
-            if port['interface_id']:
-                raise exc.NetworkInUse(net_id=net_id)
-
-        # Delete from DB
-        db.network_destroy(net_id)
-
-        # delete from network ctrl. Remote error on delete is ignored
-        try:
-            resource = '/tenants/%s/networks/%s' % (tenant_id, net_id)
-            ret = self.servers.delete(resource)
-            if not self.servers.action_success(ret):
-                raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to update remote network: %s' %
-                e.message)
-
-        # return deleted network
-        return net
-
-    def get_all_ports(self, tenant_id, net_id, **kwargs):
+    def __get_all_ports(self, tenant_id, net_id, **kwargs):
         """
         Retrieves all port identifiers belonging to the
         specified Virtual Network.
@@ -686,15 +897,18 @@ class QuantumRestProxy(QuantumPluginBase):
                                      on the specified quantum network
                        }
                     ]
-        :raises: exception.NetworkNotFound
+        :raises: exceptions.NetworkNotFound
         """
-        LOG.debug("QuantumRestProxy: get_all_ports() called")
+        LOG.debug("QuantumRestProxy: __get_all_ports() called")
         db.validate_network_ownership(tenant_id, net_id)
+
+        def filter_port(self, filter_opts, port):
+            return port
 
         filter_fn = None
         filter_opts = kwargs.get('filter_opts', None)
         if filter_opts is not None and len(filter_opts) > 0:
-            filter_fn = self.filter_port
+            filter_fn = filter_port
             LOG.debug("QuantumRestProxy: filter_opts ignored: %s" %
                       filter_opts)
 
@@ -710,7 +924,7 @@ class QuantumRestProxy(QuantumPluginBase):
             port_ids.append(d)
         return port_ids
 
-    def get_port_details(self, tenant_id, net_id, port_id):
+    def __get_port_details(self, tenant_id, net_id, port_id):
         """
         This method allows the user to retrieve a remote interface
         that is attached to this particular port.
@@ -723,226 +937,12 @@ class QuantumRestProxy(QuantumPluginBase):
                      'port-state': port state
                      'port-op-state': port operation state
                     }
-        :raises: exception.PortNotFound
-        :raises: exception.NetworkNotFound
+        :raises: exceptions.PortNotFound
+        :raises: exceptions.NetworkNotFound
         """
-        LOG.debug("QuantumRestProxy: get_port_details() called")
+        LOG.debug("QuantumRestProxy: __get_port_details() called")
         port = self.get_port(tenant_id, net_id, port_id)
         return self.make_port_dict(port)
-
-    def create_port(self, tenant_id, net_id, port_state=None, **kwargs):
-        """
-        Creates a port on the specified Virtual Network.
-
-        :returns: a mapping sequence with the following signature:
-                    {'port-id': uuid representing the created port
-                                   on specified quantum network
-                    }
-        :raises: exception.NetworkNotFound
-        :raises: exception.StateInvalid
-        """
-        LOG.debug("QuantumRestProxy: create_port() called")
-        self.get_network(tenant_id, net_id)
-
-        # Update DB
-        port = db.port_create(net_id, port_state,
-                    op_status=OperationalStatus.DOWN)
-        port_id = str(port.uuid)
-
-        # create on networl ctrl
-        try:
-            resource = '/tenants/%s/networks/%s/ports' % (
-                    tenant_id, net_id)
-            data = {
-                "port": {
-                    "id": port_id,
-                    "state": port_state,
-                }
-            }
-            ret = self.servers.post(resource, data)
-            if not self.servers.action_success(ret):
-                raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to create remote port: %s' %
-                e.message)
-            db.port_destroy(port_id, net_id)
-            raise
-
-        return self.make_port_dict(port)
-
-    def update_port(self, tenant_id, net_id, port_id, **kwargs):
-        """
-        Updates the attributes of a specific port on the
-        specified Virtual Network.
-
-        :returns: a mapping sequence with the following signature:
-                    {'port-id': uuid representing the
-                                 updated port on specified quantum network
-                     'port-state': update port state( UP or DOWN)
-                    }
-        :raises: exception.StateInvalid
-        :raises: exception.PortNotFound
-        """
-        LOG.debug("QuantumRestProxy: update_port() called")
-        self.get_network(tenant_id, net_id)
-        orig_port = self.get_port(tenant_id, net_id, port_id)
-
-        # Update DB
-        port = db.port_update(port_id, net_id, **kwargs)
-
-        # update on networl ctrl
-        try:
-            resource = '/tenants/%s/networks/%s/ports/%s' % (
-                    tenant_id, net_id, port_id)
-            data = {
-                    "port": kwargs,
-            }
-            ret = self.servers.put(resource, data)
-            if not self.servers.action_success(ret):
-                raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to create remote port: %s' %
-                e.message)
-            # reset port to original state
-            orig_port = dict((k.split('-')[-1], v)
-                for k, v in orig_port.items())
-            if 'id' in orig_port:
-                orig_port.pop('id')
-            db.port_update(net_id, tenant_id, **orig_port)
-            raise
-
-        return self.make_port_dict(port)
-
-    def delete_port(self, tenant_id, net_id, port_id):
-        """
-        Deletes a port on a specified Virtual Network,
-        if the port contains a remote interface attachment,
-        the remote interface is first un-plugged and then the port
-        is deleted.
-
-        :returns: a mapping sequence with the following signature:
-                    {'port-id': uuid representing the deleted port
-                                 on specified quantum network
-                    }
-        :raises: exception.PortInUse
-        :raises: exception.PortNotFound
-        :raises: exception.NetworkNotFound
-        """
-        LOG.debug("QuantumRestProxy: delete_port() called")
-        net = self.get_network(tenant_id, net_id)
-        port = self.get_port(tenant_id, net_id, port_id)
-        if port['interface_id']:
-            raise exc.PortInUse(net_id=net_id, port_id=port_id,
-                                att_id=port['interface_id'])
-
-        # Delete from DB
-        try:
-            port = db.port_destroy(port_id, net_id)
-        except Exception, e:
-            raise Exception("Failed to delete port: %s" % str(e))
-
-        # delete from network ctrl. Remote error on delete is ignored
-        try:
-            resource = '/tenants/%s/networks/%s/ports/%s' % (
-                    tenant_id, net_id, port_id)
-            ret = self.servers.delete(resource)
-            if not self.servers.action_success(ret):
-                raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to update remote port: %s' %
-                e.message)
-
-        return self.make_port_dict(port)
-
-    def plug_interface(self, tenant_id, net_id, port_id, remote_interface_id):
-        """
-        Attaches a remote interface to the specified port on the
-        specified Virtual Network.
-
-        :returns: None
-        :raises: exception.NetworkNotFound
-        :raises: exception.PortNotFound
-        :raises: exception.AlreadyAttached
-                    (? should the network automatically unplug/replug)
-        """
-        LOG.debug("QuantumRestProxy: plug_interface() called")
-        port = self.get_port(tenant_id, net_id, port_id)
-        self.validate_attachment(tenant_id, net_id, port_id,
-                                  remote_interface_id)
-        if port['interface_id']:
-            raise exc.PortInUse(net_id=net_id, port_id=port_id,
-                                att_id=port['interface_id'])
-
-        # Update DB
-        db.port_set_attachment(port_id, net_id, remote_interface_id)
-
-        # update attachment on network controller
-        try:
-            net_name = self.get_network(tenant_id, net_id).name
-            gateway = self.nova.get_gateway(net_id)
-            mac = self.nova.get_mac(remote_interface_id)
-
-            if gateway is not None:
-                resource = '/tenants/%s/networks/%s' % (
-                        tenant_id, net_id)
-                data = {
-                    "network": {
-                        "id": net_id,
-                        "gateway": gateway,
-                        "name": net_name,
-                    }
-                }
-                ret = self.servers.put(resource, data)
-                if not self.servers.action_success(ret):
-                    raise RemoteRestError(ret[2])
-
-            if mac is not None:
-                resource = '/tenants/%s/networks/%s/ports/%s/attachment' % (
-                        tenant_id, net_id, port_id)
-                data = {"attachment": {
-                    "id": remote_interface_id,
-                    "mac": mac,
-                }}
-                ret = self.servers.put(resource, data)
-                if not self.servers.action_success(ret):
-                    raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to update remote network: %s' %
-                e.message)
-            # undo the connect
-            db.port_unset_attachment(port_id, net_id)
-            raise
-
-    def unplug_interface(self, tenant_id, net_id, port_id):
-        """
-        Detaches a remote interface from the specified port on the
-        specified Virtual Network.
-
-        :returns: None
-        :raises: exception.NetworkNotFound
-        :raises: exception.PortNotFound
-        """
-        LOG.debug("QuantumRestProxy: unplug_interface() called")
-        self.get_port(tenant_id, net_id, port_id)
-
-        # Update DB
-        db.port_unset_attachment(port_id, net_id)
-
-        # delete from network ctrl. Remote error on delete is ignored
-        try:
-            resource = '/tenants/%s/networks/%s/ports/%s/attachment' % (
-                    tenant_id, net_id, port_id)
-            ret = self.servers.delete(resource)
-            if not self.servers.action_success(ret):
-                raise RemoteRestError(ret[2])
-        except RemoteRestError as e:
-            LOG.error(
-                'QuantumRestProxy: Unable to update remote port: %s' %
-                e.message)
 
     def send_all_data(self):
         """
@@ -955,7 +955,7 @@ class QuantumRestProxy(QuantumPluginBase):
 
         nova_networks = self.nova.get_networks() or []
         for (tenant_id, net_id) in nova_networks:
-            net = self.get_network_details(tenant_id, net_id)
+            net = self.__get_network_details(tenant_id, net_id)
             networks[net_id] = {
                 'id': net.get('net-id'),
                 'name': net.get('net-name'),
@@ -967,7 +967,7 @@ class QuantumRestProxy(QuantumPluginBase):
             net_ports = net.get('net-ports') or []
             for port in net_ports:
                 port_id = port.get('port-id')
-                port = self.get_port_details(tenant_id, net_id, port_id)
+                port = self.__get_port_details(tenant_id, net_id, port_id)
                 port_details = {
                     'id': port.get('port-id'),
                     'attachment': {
