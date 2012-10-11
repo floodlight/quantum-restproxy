@@ -209,7 +209,7 @@ index 8a93608..bb17345 100755
 +        add_nova_opt "libvirt_ovs_bridge=br-int"
 +    fi
 +
-+    if is_service_enabled q-svc && [[ "$Q_PLUGIN" = "restproxy" ]]; then
++    if is_service_enabled quantum && [[ "$Q_PLUGIN" = "restproxy" ]]; then
 +        add_nova_opt "libvirt_vif_type=ethernet"
 +        add_nova_opt "libvirt_vif_driver=nova.virt.libvirt.vif.LibvirtOpenVswitchDriver"
 +        add_nova_opt "linuxnet_interface_driver=nova.network.linux_net.LinuxOVSInterfaceDriver"
@@ -230,8 +230,16 @@ SCREENPID=`screen -ls | grep \\.stack | cut -f1 -d.`
 
 # apply patches
 (
-    cd ${STACK_TOP}/python-quantumclient;
+    cd ${STACK_TOP}/python-quantumclient
     git checkout 9b09f53a158a6184a560190b0d26293dcc1a44a6
+    cd ${STACK_TOP}/python-novaclient
+    git checkout a11788515e800a95d5b83448c2a9403eed509bdf
+    cd ${STACK_TOP}/python-keystoneclient
+    git checkout ea3f85f026f25460f47f2f0d5974daa104c15fcc
+    sed -i "s/keystone.token.backends.kvs.Token/keystone.token.backends.sql.Token/" \
+        ${STACK_TOP}/keystone/etc/keystone.conf || :
+    sed -i "s/keystone.token.backends.kvs.Token/keystone.token.backends.sql.Token/" \
+        ${STACK_TOP}/keystone/etc/keystone.conf.sample || :
     cd ${STACK_TOP}/nova
     patch -p0 < ${HOME}/devstack/patch.nova
     cd ${HOME}/devstack
