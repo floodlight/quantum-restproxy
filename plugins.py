@@ -51,8 +51,6 @@ import logging
 import os
 import socket
 import sys
-from sqlalchemy import create_engine, MetaData
-from sqlalchemy import Table, Column, Integer, VARCHAR
 
 from quantum.common import exceptions
 from quantum.common import topics
@@ -141,81 +139,6 @@ class ConfigProxy(object):
 
         raise ConfigurationError(_("Can find conf file: %s [%r]" % \
             (filename, config_file_dirs)))
-
-
-class NovaDbProxy(object):
-    """
-    Proxy for Nova controller that uses access to Nova DB
-
-    Used for following functions:
-    get_mac: lookup MAC address assigned to a virtual interface
-    get_gateway: lookup gateway for a virtual network
-    get_networks: list all networks
-    """
-
-    def __init__(self, novadb):
-        self.nova_db = create_engine(novadb)
-        self.nova_metadata = MetaData()
-        self.nova_metadata.bind = self.nova_db
-        self.nova_vifs = Table('virtual_interfaces', self.nova_metadata,
-            Column('id', Integer),
-            Column('uuid', VARCHAR(255)),
-            Column('instance_id', Integer),
-            Column('address', VARCHAR(36)))
-        self.nova_vnets = Table('networks', self.nova_metadata,
-            Column('id', Integer),
-            Column('uuid', VARCHAR(255)),
-            Column('project_id', VARCHAR(255)),
-            Column('gateway', VARCHAR(36)))
-
-    def get_mac(self, vif):
-        try:
-            vifq = self.nova_vifs.select(self.nova_vifs.c.uuid == str(vif))
-            vifs = vifq.execute()
-            if vifs.rowcount == 0:
-                raise Exception(
-                    'Matching vif not found in nova database: ' + str(vif))
-            if vifs.rowcount > 1:
-                raise Exception(
-                    'More than one vif found in nova database!: ' + str(vif))
-            (_, _, _, address) = vifs.fetchone()
-            return address
-        except Exception, excp:
-            LOG.error(str(excp))
-            return None
-
-    def get_gateway(self, vnet):
-        try:
-            vnetq = self.nova_vnets.select(self.nova_vnets.c.uuid == str(vnet))
-            vnets = vnetq.execute()
-            if vnets.rowcount == 0:
-                raise Exception(
-                    'Matching network not found in nova database: ' +
-                    str(vnet))
-            if vnets.rowcount > 1:
-                raise Exception(
-                    'More than one network found in nova database!: ' +
-                    str(vnet))
-            (_, _, _, gateway) = vnets.fetchone()
-            return gateway
-        except Exception, excp:
-            LOG.error(str(excp))
-            return None
-
-    def get_networks(self):
-        ret = []
-        try:
-            vnetq = self.nova_vnets.select()
-            vnets = vnetq.execute()
-            for i in range(vnets.rowcount):
-                (_, net_id, tenant_id, _) = vnets.fetchone()
-                if tenant_id is None:
-                    tenant_id = 'default'
-                ret.append((tenant_id, net_id))
-        except Exception, excp:
-            LOG.error(str(excp))
-            return None
-        return ret
 
 
 class ServerProxy(object):
@@ -374,14 +297,11 @@ class QuantumRestProxy(db_base_plugin_v2.QuantumDbPluginV2):
         # read config
         proxydb = self.conf.get('proxydb') or \
                 'mysql://root@localhost/restproxy'
-        novadb = self.conf.get('novadb') or \
-                'mysql://root@localhost/nova'
         servers = self.conf.get('servers')
         serverauth = self.conf.get('serverauth')
         serverssl = self.conf.get_bool('serverssl')
 
         # validate config
-        assert novadb, 'Nova must be accessible from plugin'
         assert servers is not None, 'Servers not defined. Aborting plugin'
         servers = tuple(s.split(':') for s in servers.split(','))
         servers = tuple((server, int(port)) for server, port in servers)
@@ -393,7 +313,6 @@ class QuantumRestProxy(db_base_plugin_v2.QuantumDbPluginV2):
             'sql_connection': proxydb,
             'base': models_v2.model_base.BASEV2,
         })
-        self.nova = NovaDbProxy(novadb)
         self.servers = ServerPool(servers, serverssl, serverauth)
 
         # init dhcp support
@@ -851,137 +770,48 @@ class QuantumRestProxy(db_base_plugin_v2.QuantumDbPluginV2):
 
         return None
 
-    def __get_network_details(self, tenant_id, net_id):
-        """
-        Retrieves a list of all the remote vifs that
-        are attached to the network.
-
-        :returns: a sequence of mappings with the following signature:
-                    {'net-id': uuid that uniquely identifies the
-                                particular quantum network
-                     'net-name': a human-readable name associated
-                                 with network referenced by net-id
-                     'net-ports': [{"port-id": "vif1"},
-                                   {"port-id": "vif2"},...,
-                                   {"port-id": "vifn"}]
-                    }
-        :raises: exceptions.NetworkNotFound
-        """
-        LOG.debug("QuantumRestProxy: __get_network_details() called")
-        net = self.get_network(tenant_id, net_id)
-        ports = self.__get_all_ports(tenant_id, net_id)
-        return {
-            'net-id': str(net.uuid),
-            'net-name': net.name,
-            'net-op-status': net.op_status,
-            'net-ports': ports,
-        }
-
-    def __get_all_ports(self, tenant_id, net_id, **kwargs):
-        """
-        Retrieves all port identifiers belonging to the
-        specified Virtual Network.
-        :param tenant_id: unique identifier for the tenant for which this
-            method is going to retrieve ports
-        :param net_id: unique identifiers for the network whose ports are
-            about to be retrieved
-        :param **kwargs: options to be passed to the plugin. The following
-            keywork based-options can be specified:
-            filter_opts - options for filtering network list
-        :returns: a list of mapping sequences with the following signature:
-                     [ {'port-id': uuid representing a particular port
-                                    on the specified quantum network
-                       },
-                       ....
-                       {'port-id': uuid representing a particular port
-                                     on the specified quantum network
-                       }
-                    ]
-        :raises: exceptions.NetworkNotFound
-        """
-        LOG.debug("QuantumRestProxy: __get_all_ports() called")
-        db.validate_network_ownership(tenant_id, net_id)
-
-        def filter_port(self, filter_opts, port):
-            return port
-
-        filter_fn = None
-        filter_opts = kwargs.get('filter_opts', None)
-        if filter_opts is not None and len(filter_opts) > 0:
-            filter_fn = filter_port
-            LOG.debug("QuantumRestProxy: filter_opts ignored: %s" %
-                      filter_opts)
-
-        port_ids = []
-        ports = db.port_list(net_id)
-        for port in ports:
-            if filter_fn is not None and \
-               filter_fn(filter_opts, port) is None:
-                continue
-            d = {
-                'port-id': str(port.uuid),
-            }
-            port_ids.append(d)
-        return port_ids
-
-    def __get_port_details(self, tenant_id, net_id, port_id):
-        """
-        This method allows the user to retrieve a remote interface
-        that is attached to this particular port.
-
-        :returns: a mapping sequence with the following signature:
-                    {'port-id': uuid representing the port on
-                                 specified quantum network
-                     'attachment': uuid of the virtual interface
-                                   bound to the port, None otherwise
-                     'port-state': port state
-                     'port-op-state': port operation state
-                    }
-        :raises: exceptions.PortNotFound
-        :raises: exceptions.NetworkNotFound
-        """
-        LOG.debug("QuantumRestProxy: __get_port_details() called")
-        port = self.get_port(tenant_id, net_id, port_id)
-        return self.make_port_dict(port)
-
     def send_all_data(self):
         """
         Pushes all data to network ctrl (networks/ports, ports/attachments)
         to give the controller an option to re-sync it's persistent store
         with quantum's current view of that data.
         """
+        admin_context = glbcontext.get_admin_context()
         networks = {}
         ports = {}
 
-        nova_networks = self.nova.get_networks() or []
-        for (tenant_id, net_id) in nova_networks:
-            net = self.__get_network_details(tenant_id, net_id)
-            networks[net_id] = {
-                'id': net.get('net-id'),
-                'name': net.get('net-name'),
-                'gateway': self.nova.get_gateway(net_id),
-                'op-status': net.get('net-op-status'),
+        nova_networks = self.get_networks(admin_context) or []
+        for net in nova_networks:
+            networks[net.get('id')] = {
+                'id': net.get('id'),
+                'name': net.get('name'),
+                'op-status': net.get('admin_state_up'),
             }
 
+            subnets = net.get('subnets') or []
+            for subnet_id in subnets:
+                subnet = self.get_subnet(admin_context, subnet_id)
+                if subnet.get('gateway_ip') is not None:
+                    # FIX: For backward compatibility with wire protocol
+                    networks[net.get('id')]['gateway'] = \
+                            subnet.get('gateway_ip')
+
             ports = []
-            net_ports = net.get('net-ports') or []
+            net_filter = {'network_id': [net.get('id')]}
+            net_ports = self.get_ports(admin_context, filters=net_filter) or []
             for port in net_ports:
-                port_id = port.get('port-id')
-                port = self.__get_port_details(tenant_id, net_id, port_id)
                 port_details = {
-                    'id': port.get('port-id'),
+                    'id': port.get('id'),
                     'attachment': {
-                        'id': port.get('attachment'),
+                        'id': port.get('id') + '00',
+                        'mac': port.get('mac_address'),
                     },
-                    'state': port.get('port-state'),
-                    'op-status': port.get('port-op-status'),
+                    'state': port.get('status'),
+                    'op-status': port.get('admin_state_up'),
                     'mac': None
                 }
-                if port['attachment']:
-                    port_details['attachment']['mac'] = \
-                        self.nova.get_mac(port['attachment'])
                 ports.append(port_details)
-            networks[net_id]['ports'] = ports
+            networks[net.get('id')]['ports'] = ports
         try:
             resource = '/topology'
             data = {
