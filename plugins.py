@@ -567,7 +567,7 @@ class QuantumRestProxy(db_base_plugin_v2.QuantumDbPluginV2):
             if port["port"].get("device_id"):
                 self.plug_interface(context,
                     net["tenant_id"], net["id"],
-                    new_port["id"], port["port"]["device_id"])
+                    new_port["id"], new_port["id"] + "00")
         except RemoteRestError as e:
             LOG.error(
                 "QuantumRestProxy: Unable to create remote port: %s" %
@@ -635,7 +635,7 @@ class QuantumRestProxy(db_base_plugin_v2.QuantumDbPluginV2):
                 if new_port.get("device_id"):
                     self.plug_interface(context,
                         new_port["tenant_id"], new_port["network_id"],
-                        new_port["id"], new_port["device_id"])
+                        new_port["id"], new_port["id"] + "00")
 
         except RemoteRestError as e:
             LOG.error(
