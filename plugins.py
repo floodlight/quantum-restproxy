@@ -578,7 +578,7 @@ class QuantumRestProxy(db_base_plugin_v2.QuantumDbPluginV2):
         # Set port state up and return that port
         port_update = {"port": {"admin_state_up": True}}
         return super(QuantumRestProxy, self).update_port(context,
-                new_port["port"]["id"], port_update)
+                new_port["id"], port_update)
 
     def update_port(self, context, port_id, port):
         """
