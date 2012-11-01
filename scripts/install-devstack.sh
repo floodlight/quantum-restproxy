@@ -65,7 +65,7 @@ ADMIN_PASSWORD=${STACK_PASSWORD}
 
 # enable quantum and ovs-plugin
 Q_PLUGIN=openvswitch
-ENABLED_SERVICES="g-api,g-reg,key,n-api,n-cpu,n-net,n-sch,n-novnc,n-xvnc,n-cauth,horizon,mysql,rabbit,openstackx,q-svc,q-agt,quantum"
+ENABLED_SERVICES="g-api,g-reg,key,n-api,n-cpu,n-net,n-sch,n-cauth,horizon,mysql,rabbit,openstackx,q-svc,q-agt,quantum"
 EOF
 
 cat >localrc.restproxy <<EOF
@@ -79,7 +79,7 @@ ADMIN_PASSWORD=${STACK_PASSWORD}
 Q_PLUGIN=restproxy
 RESTPROXY_CONTROLERS=${RESTPROXY_CONTROLLER}
 LIBVIRT_FIREWALL_DRIVER=nova.virt.firewall.NoopFirewallDriver
-ENABLED_SERVICES="g-api,g-reg,key,n-api,n-cpu,n-net,n-sch,n-novnc,n-xvnc,n-cauth,horizon,mysql,rabbit,openstackx,q-svc,q-agt,quantum"
+ENABLED_SERVICES="g-api,g-reg,key,n-api,n-cpu,n-net,n-sch,n-cauth,horizon,mysql,rabbit,openstackx,q-svc,q-agt,quantum"
 EOF
 
 cat >restproxy.ini <<EOF
