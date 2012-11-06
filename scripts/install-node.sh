@@ -56,11 +56,14 @@ sudo apt-get -y install \
 sudo ovs-vsctl --no-wait -- --if-exists del-br ${OVS_BRIDGE}
 sudo ovs-vsctl --no-wait add-br ${OVS_BRIDGE}
 sudo ovs-vsctl --no-wait br-set-external-id ${OVS_BRIDGE} bridge-id br-int
+
+ctrls=
 for ctrl in `echo ${NETWORK_CONTROLERS} | tr ',' ' '`
 do
-    echo "Adding Network conttroller: " ${ctrl}
-    sudo ovs-vsctl set-controller ${OVS_BRIDGE} "tcp:${ctrl}:6633"
+    ctrls="${ctrls} tcp:${ctrl}:6633"
 done
+echo "Adding Network conttrollers: " ${ctrls}
+sudo ovs-vsctl --no-wait set-controller ${OVS_BRIDGE} ${ctrls}
 
 
 # Done
