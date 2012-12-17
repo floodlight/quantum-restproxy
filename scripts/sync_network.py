@@ -31,20 +31,27 @@ import warnings
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    from quantum.plugins.restproxy.plugins import QuantumRestProxy
+    from quantum.plugins.restproxy.plugin import QuantumRestProxyV2
+from quantum.openstack.common import cfg
+
 
 def do_send_all_data():
     """Send all data to the configured network controller
        retunrs: None on success, else the reason for error (string)
     """
     try:
-        rproxy = QuantumRestProxy()
-        rproxy.send_all_data()
+        rproxy = QuantumRestProxyV2()
+        print "INFO: Using servers: ", cfg.CONF.RESTPROXY.servers
+        rproxy._send_all_data()
     except Exception as e:
         return e.message
     return None
 
 if __name__ == "__main__":
+    cfg.CONF(args = [
+        '--config-file',
+        '/etc/quantum/plugins/restproxy/restproxy.ini'
+        ], project='quantum')
     ret = do_send_all_data()
     if ret is not None:
         print "ERROR: In sending data to network controller"
